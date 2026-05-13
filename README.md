@@ -62,13 +62,13 @@ This tool moves those directories to an external SSD, replaces them with symlink
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/scripts.git ~/scripts
+git clone [https://github.com/YOUR_USERNAME/scripts.git](https://github.com/Gautamneeraj88/offload.git) ~/scripts
 ```
 
 Or if you want it somewhere else:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/scripts.git /path/to/scripts
+git clone [https://github.com/YOUR_USERNAME/scripts.git](https://github.com/Gautamneeraj88/offload.git) /path/to/scripts
 ```
 
 ### 2. Add to PATH
