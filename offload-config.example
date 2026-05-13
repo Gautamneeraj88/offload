@@ -1,0 +1,65 @@
+# ~/.offload-config — offload tool configuration
+# Copy this to ~/.offload-config and edit for your setup.
+# Lines starting with # are comments. Blank lines ignored.
+# The script re-reads this file on every invocation — no restart needed.
+
+# ─── Mount points ────────────────────────────────────────────────
+# macOS:
+EXT_MOUNT=/Volumes/MyDrive
+EXT_HOME=/Volumes/MyDrive/home
+
+# Linux example:
+# EXT_MOUNT=/mnt/external
+# EXT_HOME=/mnt/external/home
+
+# ─── Symlinks ────────────────────────────────────────────────────
+# Format: SYMLINK|<source-relative-to-$HOME>|<absolute-target>|<description>
+# Add one line per directory you want to live on the external disk.
+# Run: offload scan   — to see candidates with their sizes.
+
+# Developer toolchains (high value — these are large and rarely change)
+SYMLINK|.cargo|/Volumes/MyDrive/home/.cargo|Rust toolchain
+SYMLINK|.rustup|/Volumes/MyDrive/home/.rustup|Rust versions
+SYMLINK|.pyenv|/Volumes/MyDrive/home/.pyenv|Python versions (pyenv)
+SYMLINK|go|/Volumes/MyDrive/home/go|Go workspace
+
+# Package caches
+SYMLINK|.npm|/Volumes/MyDrive/home/.npm|npm cache
+SYMLINK|.yarn|/Volumes/MyDrive/home/.yarn|yarn cache
+SYMLINK|.bun|/Volumes/MyDrive/home/.bun|bun runtime + cache
+SYMLINK|.gradle|/Volumes/MyDrive/home/.gradle|Gradle cache
+SYMLINK|.pub-cache|/Volumes/MyDrive/home/.pub-cache|Dart/Flutter pub cache
+SYMLINK|.gem|/Volumes/MyDrive/home/.gem|Ruby gems (system)
+
+# AI / model data (can be very large)
+# SYMLINK|.ollama|/Volumes/MyDrive/home/.ollama|Ollama models
+
+# Git / project directories (optional — only if they're large)
+# SYMLINK|GitHub|/Volumes/MyDrive/home/GitHub|All git repos
+
+# ─── Services ────────────────────────────────────────────────────
+# Format: SERVICE|<name>|<start-command>|<stop-command>|<check-command>
+# Check command: exit 0 = running, non-zero = stopped.
+# Add services whose data lives on the external disk.
+
+# SERVICE|podman|podman machine start|podman machine stop|podman machine list --format '{{.Running}}' | grep -q true
+# SERVICE|ollama|ollama serve > /tmp/ollama.log 2>&1 &|pkill -x ollama|pgrep -x ollama
+
+# ─── Never-symlink list ──────────────────────────────────────────
+# Format: NEVER|<name>|<reason>
+# These will be skipped by `offload scan` and rejected by `offload add`.
+
+NEVER|.ssh|Permissions sensitive — must stay local
+NEVER|.config|Shell startup dependency — must stay local
+NEVER|Library|macOS-managed — do not move
+NEVER|Documents|iCloud sync
+NEVER|Desktop|User intent
+NEVER|Downloads|User intent
+NEVER|Applications|System-managed
+NEVER|Movies|User data
+NEVER|Music|User data
+NEVER|Pictures|iCloud Photos
+NEVER|.Trash|System
+NEVER|.zshrc|Shell config — must stay local
+NEVER|.zsh_history|Shell history — must stay local
+NEVER|.gitconfig|Small + startup dependency

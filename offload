@@ -1,0 +1,716 @@
+#!/usr/bin/env zsh
+# offload — unified offload manager for MacBook Air M4
+# Usage: offload [command] [args] [--yes] [--dry-run]
+
+SCRIPT_DIR="${0:A:h}"
+source "$SCRIPT_DIR/lib/common.sh"
+
+AUTO_YES=false
+DRY_RUN=false
+for arg in "$@"; do
+  [[ "$arg" == "--yes" ]]     && AUTO_YES=true
+  [[ "$arg" == "--dry-run" ]] && DRY_RUN=true
+done
+
+load_config || exit 1
+
+# ─── status ───────────────────────────────────────────────────────────
+cmd_status() {
+  header "Disk usage"
+  df -h / "$EXT_MOUNT" 2>/dev/null | awk 'NR==1 || /\/$|backup/'
+
+  header "External disk"
+  if mount_check; then
+    ok "$EXT_MOUNT mounted — $(df -h "$EXT_MOUNT" | awk 'NR==2 {print $4}') free"
+    [[ -d "$EXT_HOME" ]] && info "Migrated data: $(human "$EXT_HOME")"
+  else
+    err "$EXT_MOUNT NOT mounted — symlinked tools will fail"
+    dim "Plug in disk, then: offload start"
+  fi
+
+  header "Symlinks ($(echo "${SYMLINKS[@]}" | wc -w | xargs) tracked)"
+  local healthy=0 broken=0 missing=0 wrong=0
+  for line in "${SYMLINKS[@]}"; do
+    parse_symlink "$line"
+    symlink_status "$SL_SRC"
+    case $? in
+    0) healthy=$((healthy + 1)) ;;
+    1) broken=$((broken + 1)) ;;
+    2) wrong=$((wrong + 1)) ;;
+    3) missing=$((missing + 1)) ;;
+    esac
+  done
+  echo "  ${G}$healthy healthy${N}  ${R}$broken broken${N}  ${Y}$wrong not-linked${N}  ${D}$missing missing${N}"
+
+  header "Services"
+  for line in "${SERVICES[@]}"; do
+    parse_service "$line"
+    if service_running "$SV_CHECK"; then
+      ok "$SV_NAME running"
+    else
+      dim "  $SV_NAME stopped"
+    fi
+  done
+
+  header "Top 10 \$HOME folders"
+  du -sh ~/* ~/.[!.]* 2>/dev/null | sort -hr | head -10
+
+  echo ""
+  dim "Try: offload start | scan | verify | clean | help"
+}
+
+# ─── start (work-start) ───────────────────────────────────────────────
+cmd_start() {
+  header "Starting work session"
+
+  step "Checking external disk"
+  if ! mount_check; then
+    err "External disk not mounted"
+    info "If plugged in but not appearing:"
+    echo "    diskutil list"
+    echo "    diskutil mount /dev/diskNs2"
+    return 1
+  fi
+  ok "Disk mounted — $(df -h "$EXT_MOUNT" | awk 'NR==2 {print $4}') free"
+
+  step "Verifying symlinks"
+  local broken=0
+  for line in "${SYMLINKS[@]}"; do
+    parse_symlink "$line"
+    if [[ -L "$HOME/$SL_SRC" && ! -e "$HOME/$SL_SRC" ]]; then
+      err "broken: ~/$SL_SRC"
+      broken=$((broken + 1))
+    fi
+  done
+  if ((broken > 0)); then
+    err "$broken broken symlinks — wrong disk?"
+    return 1
+  fi
+  ok "All symlinks healthy"
+
+  step "Starting services"
+  for line in "${SERVICES[@]}"; do
+    parse_service "$line"
+    if service_running "$SV_CHECK"; then
+      ok "$SV_NAME already running"
+    else
+      step "  Starting $SV_NAME"
+      eval "$SV_START" 2>/dev/null
+      sleep 2
+      if service_running "$SV_CHECK"; then
+        ok "$SV_NAME ready"
+      else
+        warn "$SV_NAME didn't start cleanly (check logs)"
+      fi
+    fi
+  done
+
+  date '+%Y-%m-%d %H:%M:%S' >"$STATE_FILE"
+  echo ""
+  echo "${BOLD}${G}Ready to code.${N}  ${D}offload stop${N} when done."
+}
+
+# ─── stop (work-stop) ─────────────────────────────────────────────────
+cmd_stop() {
+  header "Stopping work session"
+
+  step "Stopping services"
+  for line in "${SERVICES[@]}"; do
+    parse_service "$line"
+    if service_running "$SV_CHECK"; then
+      step "  Stopping $SV_NAME"
+      eval "$SV_STOP" 2>/dev/null
+      sleep 1
+      ok "$SV_NAME stopped"
+    else
+      dim "  $SV_NAME not running"
+    fi
+  done
+
+  step "Checking for processes holding the disk"
+  if mount_check; then
+    local busy
+    busy=$(lsof "$EXT_MOUNT" 2>/dev/null | tail -n +2 | awk '{print $1 " (" $2 ")"}' | sort -u)
+    if [[ -n "$busy" ]]; then
+      err "Processes still using $EXT_MOUNT:"
+      echo "$busy" | sed 's/^/    /'
+      echo ""
+      info "Close these, then re-run: offload stop"
+      info "Or force: offload stop --force"
+      [[ "$1" != "--force" ]] && return 1
+      warn "Force mode — proceeding anyway"
+    else
+      ok "No processes holding disk"
+    fi
+
+    step "Ejecting $EXT_MOUNT"
+    if diskutil eject "$EXT_MOUNT" 2>/dev/null; then
+      ok "Disk ejected — safe to unplug"
+    else
+      err "Eject failed. Try: diskutil unmount force $EXT_MOUNT"
+      return 1
+    fi
+  else
+    info "Disk already unmounted"
+  fi
+
+  rm -f "$STATE_FILE"
+  echo ""
+  echo "${BOLD}${G}Done. Unplug whenever.${N}"
+}
+
+# ─── verify ───────────────────────────────────────────────────────────
+cmd_verify() {
+  header "Verifying all symlinks"
+  local healthy=0 broken=0 not_linked=0 missing=0
+  for line in "${SYMLINKS[@]}"; do
+    parse_symlink "$line"
+    local src="$HOME/$SL_SRC"
+    symlink_status "$SL_SRC"
+    case $? in
+    0)
+      ok "$SL_SRC → $(readlink "$src")"
+      healthy=$((healthy + 1))
+      ;;
+    1)
+      err "$SL_SRC → $(readlink "$src") ${R}[broken]${N}"
+      broken=$((broken + 1))
+      ;;
+    2)
+      warn "$SL_SRC exists but is NOT a symlink ${D}(local copy?)${N}"
+      not_linked=$((not_linked + 1))
+      ;;
+    3)
+      dim "$SL_SRC — not present"
+      missing=$((missing + 1))
+      ;;
+    esac
+  done
+  echo ""
+  echo "  ${G}$healthy healthy${N}  ${R}$broken broken${N}  ${Y}$not_linked local${N}  ${D}$missing missing${N}"
+
+  header "Verifying services"
+  for line in "${SERVICES[@]}"; do
+    parse_service "$line"
+    if service_running "$SV_CHECK"; then
+      ok "$SV_NAME running"
+    else
+      dim "  $SV_NAME stopped"
+    fi
+  done
+}
+
+# ─── scan — find new candidates ───────────────────────────────────────
+cmd_scan() {
+  header "Scanning for new symlink candidates"
+  info "Folders in \$HOME not yet in config (and not in NEVER list):"
+  echo ""
+
+  typeset -A known never
+  local name sz entry line
+  for line in "${SYMLINKS[@]}"; do
+    parse_symlink "$line"
+    known[$SL_SRC]=1
+  done
+  for line in "${NEVER[@]}"; do
+    name="${line#NEVER|}"
+    name="${name%%|*}"
+    never[$name]=1
+  done
+
+  printf "  %-30s %10s  %s\n" "FOLDER" "SIZE" "STATUS"
+  printf "  %-30s %10s  %s\n" "------" "----" "------"
+
+  for entry in ~/*(N/) ~/.[!.]*(N/); do
+    name="${entry:t}"
+    [[ -L "$entry" ]] && continue
+    [[ -n "${known[$name]}" ]] && continue
+    [[ -n "${never[$name]}" ]] && continue
+    sz=$(human "$entry")
+    printf "  %-30s %10s  ${C}candidate${N}\n" "$name" "$sz"
+  done
+
+  echo ""
+  dim "To migrate one: offload add <name>"
+  dim "To skip one permanently: edit ~/.offload-config and add a NEVER line"
+}
+
+# ─── add — migrate a folder to external ───────────────────────────────
+cmd_add() {
+  source "$SCRIPT_DIR/lib/migration.sh"
+  local name="$1"
+
+  if [[ -z "$name" ]]; then
+    err "Usage: offload add <folder-name>"
+    return 1
+  fi
+
+  if ! mount_check; then
+    err "External disk not mounted"
+    return 1
+  fi
+
+  for line in "${NEVER[@]}"; do
+    local n="${line#NEVER|}"; n="${n%%|*}"
+    if [[ "$n" == "$name" ]]; then
+      err "$name is in the NEVER list — refusing to migrate"
+      dim "Remove from ~/.offload-config to override"
+      return 1
+    fi
+  done
+
+  local target="$EXT_HOME/$name"
+  migrate_path "$name" "$target" || return 1
+
+  if ! grep -q "^SYMLINK|$name|" "$CONFIG_FILE" 2>/dev/null; then
+    echo "SYMLINK|$name|$target|Added $(date +%Y-%m-%d)" >> "$CONFIG_FILE"
+    ok "Added to ~/.offload-config"
+  fi
+}
+
+# ─── remove — un-symlink, restore to home ─────────────────────────────
+cmd_remove() {
+  source "$SCRIPT_DIR/lib/migration.sh"
+  local name="$1"
+
+  if [[ -z "$name" ]]; then
+    err "Usage: offload remove <folder-name>"
+    return 1
+  fi
+
+  local src="$HOME/$name"
+  local target=""
+
+  for line in "${SYMLINKS[@]}"; do
+    parse_symlink "$line"
+    if [[ "$SL_SRC" == "$name" ]]; then
+      target="$SL_DST"
+      break
+    fi
+  done
+
+  if [[ -z "$target" ]]; then
+    err "$name not found in ~/.offload-config"
+    return 1
+  fi
+
+  if [[ ! -L "$src" ]]; then
+    err "~/$name is not a symlink"
+    return 1
+  fi
+
+  if [[ ! -d "$target" ]]; then
+    err "External copy not found: $target"
+    return 1
+  fi
+
+  local sz
+  sz=$(human "$target")
+  warn "About to restore ~/$name ($sz) from external"
+  echo "    Source: $target"
+  echo "    Restore to: $src"
+  confirm "Proceed?" || { info "Cancelled."; return 0; }
+
+  local tmp="${src}-restore-$$"
+  step "Copying data back to home..."
+  rsync -a "$target/" "$tmp/" 2>/dev/null || {
+    err "rsync failed"
+    rm -rf "$tmp" 2>/dev/null
+    return 1
+  }
+
+  step "Removing symlink..."
+  rm "$src"
+  mv "$tmp" "$src"
+  ok "Restored ~/$name"
+
+  local tmpf
+  tmpf=$(mktemp)
+  grep -v "^SYMLINK|$name|" "$CONFIG_FILE" > "$tmpf" && mv "$tmpf" "$CONFIG_FILE"
+  ok "Removed from ~/.offload-config"
+
+  echo ""
+  warn "External copy still exists at $target"
+  if confirm "Delete external copy?"; then
+    rm -rf "$target"
+    log_action "remove: deleted external copy $target"
+    ok "External copy removed"
+  else
+    info "External copy kept at $target"
+  fi
+}
+
+# ─── doctor — diagnose & repair ───────────────────────────────────────
+cmd_doctor() {
+  header "Storage doctor"
+  local issues=0
+
+  step "Config file"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    ok "$CONFIG_FILE"
+  else
+    err "Missing: $CONFIG_FILE"
+    issues=$((issues + 1))
+  fi
+
+  step "External disk"
+  if mount_check; then
+    local ext_pct
+    ext_pct=$(df "$EXT_MOUNT" | awk 'NR==2 {gsub(/%/,"",$5); print 100-$5}')
+    ok "Mounted ($ext_pct% free)"
+    if (( ext_pct < 10 )); then
+      warn "External disk low: only ${ext_pct}% free"
+      issues=$((issues + 1))
+    fi
+  else
+    err "Not mounted — run: offload start"
+    issues=$((issues + 1))
+  fi
+
+  step "Internal disk"
+  local int_pct
+  int_pct=$(df / | awk 'NR==2 {gsub(/%/,"",$5); print 100-$5}')
+  if (( int_pct < 10 )); then
+    warn "Internal disk low: ${int_pct}% free — run: offload clean"
+    issues=$((issues + 1))
+  else
+    ok "Internal ${int_pct}% free"
+  fi
+
+  step "Symlinks"
+  for line in "${SYMLINKS[@]}"; do
+    parse_symlink "$line"
+    local src="$HOME/$SL_SRC"
+    symlink_status "$SL_SRC"
+    case $? in
+      0) ok "~/$SL_SRC → $SL_DST" ;;
+      1)
+        err "Broken: ~/$SL_SRC → $(readlink "$src")"
+        mount_check && [[ -d "$EXT_HOME/$SL_SRC" ]] && info "  Target exists on external — mount issue?"
+        issues=$((issues + 1))
+        ;;
+      2)
+        warn "Not symlinked (local copy): ~/$SL_SRC"
+        mount_check && [[ -e "$SL_DST" ]] && warn "  Both local AND external copies exist — manual review needed"
+        issues=$((issues + 1))
+        ;;
+      3)
+        dim "Missing: ~/$SL_SRC"
+        ;;
+    esac
+  done
+
+  step "Services"
+  for line in "${SERVICES[@]}"; do
+    parse_service "$line"
+    if service_running "$SV_CHECK"; then
+      ok "$SV_NAME running"
+    else
+      dim "$SV_NAME stopped (run: offload start)"
+    fi
+  done
+
+  step "pnpm store"
+  if [[ -d ~/Library/pnpm && ! -L ~/Library/pnpm ]]; then
+    warn "~/Library/pnpm not symlinked — run: offload clean pnpm_migrate"
+    issues=$((issues + 1))
+  else
+    ok "pnpm store ok"
+  fi
+
+  step "Stale /tmp sentinels"
+  local stale=0
+  for f in /tmp/.offload-*(N); do
+    local age=$(( ($(date +%s) - $(stat -f %m "$f" 2>/dev/null || echo 0)) / 86400 ))
+    if (( age > 30 )); then
+      rm -f "$f"
+      stale=$((stale + 1))
+    fi
+  done
+  (( stale > 0 )) && ok "Removed $stale stale sentinel(s)" || ok "No stale sentinels"
+
+  echo ""
+  if (( issues == 0 )); then
+    ok "All checks passed."
+  else
+    warn "$issues issue(s) found"
+  fi
+}
+
+# ─── clean — recipe-based cache prune ─────────────────────────────────
+cmd_clean() {
+  source "$SCRIPT_DIR/lib/recipes.sh"
+
+  local recipe=""
+  local list_all=false
+
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run)  DRY_RUN=true ;;
+      --yes)      AUTO_YES=true ;;
+      --list-all) list_all=true ;;
+      --*)        ;;
+      *)          recipe="$arg" ;;
+    esac
+  done
+
+  DRY_RUN=${DRY_RUN:-false}
+  AUTO_YES=${AUTO_YES:-false}
+
+  if [[ -z "$recipe" ]]; then
+    cmd_clean_list "$list_all"
+    return
+  fi
+
+  if [[ "$recipe" == "all" ]]; then
+    cmd_clean_all
+    return
+  fi
+
+  if ! declare -f "recipe_$recipe" >/dev/null 2>&1; then
+    err "Unknown recipe: $recipe"
+    echo ""
+    cmd_clean_list false
+    return 1
+  fi
+
+  cmd_clean_one "$recipe"
+}
+
+cmd_clean_list() {
+  local show_all="$1"
+  local r applicable sz nm marker
+  header "Cleanup recipes"
+  echo "${D}Current free space: $(df -h / | awk 'NR==2 {print $4}')${N}"
+  echo ""
+
+  printf "  %-26s %10s  %s\n" "RECIPE" "SIZE" "DESCRIPTION"
+  printf "  %-26s %10s  %s\n" "------" "----" "-----------"
+
+  for r in "${ALL_RECIPES[@]}"; do
+    applicable=true
+    recipe_$r applicable 2>/dev/null || applicable=false
+    if $applicable || $show_all; then
+      sz=$(recipe_$r size 2>/dev/null)
+      nm=$(recipe_$r name 2>/dev/null)
+      marker="  "
+      $applicable || marker="${D}- ${N}"
+      printf "  %s%-24s %10s  %s\n" "$marker" "$r" "$sz" "$nm"
+    fi
+  done
+
+  echo ""
+  dim "Usage: offload clean <recipe> [--dry-run] [--yes]"
+  dim "       offload clean all [--yes]"
+  dim "       offload clean --list-all  (include inapplicable)"
+}
+
+cmd_clean_one() {
+  local r="$1"
+  header "$(recipe_$r name)"
+  recipe_$r describe
+  echo ""
+
+  if ! recipe_$r applicable 2>/dev/null; then
+    warn "Not applicable on this system."
+    return
+  fi
+
+  header "Preview"
+  recipe_$r preview
+  echo ""
+
+  if $DRY_RUN; then
+    info "Dry run — no changes."
+    return
+  fi
+
+  if ! confirm "Proceed with this cleanup?"; then
+    info "Skipped."
+    return
+  fi
+
+  header "Applying"
+  local before
+  before=$(df / | awk 'NR==2 {print $4}')
+  recipe_$r apply
+  local after
+  after=$(df / | awk 'NR==2 {print $4}')
+  local reclaimed_mb=$(( (after - before) / 1024 ))
+  echo ""
+  ok "Reclaimed approximately ${reclaimed_mb} MB."
+  log_action "clean: $r reclaimed ${reclaimed_mb}MB"
+}
+
+cmd_clean_all() {
+  header "Walking all applicable recipes"
+  local before
+  before=$(df / | awk 'NR==2 {print $4}')
+
+  for r in "${ALL_RECIPES[@]}"; do
+    if recipe_$r applicable 2>/dev/null; then
+      echo ""
+      cmd_clean_one "$r"
+    fi
+  done
+
+  local after
+  after=$(df / | awk 'NR==2 {print $4}')
+  local total_mb=$(( (after - before) / 1024 ))
+  echo ""
+  header "Session total"
+  ok "Reclaimed approximately ${total_mb} MB across all recipes."
+}
+
+# ─── log — audit log viewer ────────────────────────────────────────────
+cmd_log() {
+  local tail_n=0
+  local prev=""
+  for arg in "$@"; do
+    [[ "$prev" == "--tail" ]] && tail_n="$arg"
+    prev="$arg"
+  done
+
+  if [[ ! -f ~/.offload-log ]]; then
+    info "No log yet."
+    return
+  fi
+
+  if (( tail_n > 0 )); then
+    tail -n "$tail_n" ~/.offload-log
+  else
+    cat ~/.offload-log
+  fi
+}
+
+# ─── help ──────────────────────────────────────────────────────────────
+cmd_help() {
+  local sub="${1:-}"
+
+  if [[ -n "$sub" ]]; then
+    case "$sub" in
+      start)
+        cat <<EOF
+${BOLD}offload start${N}
+Verify external disk is mounted, check all symlinks are healthy, and start
+configured services (e.g. podman). Sets ~/.offload-state timestamp.
+EOF
+        ;;
+      stop)
+        cat <<EOF
+${BOLD}offload stop [--force]${N}
+Stop all services, check for processes holding the disk, then eject.
+--force: eject even if processes are still running.
+EOF
+        ;;
+      clean)
+        cat <<EOF
+${BOLD}offload clean${N}                    List applicable cleanup recipes
+${BOLD}offload clean <recipe>${N}           Run one recipe (interactive)
+${BOLD}offload clean <recipe> --dry-run${N} Preview only, no changes
+${BOLD}offload clean <recipe> --yes${N}     Skip confirmation prompts
+${BOLD}offload clean all [--yes]${N}        Walk every applicable recipe
+${BOLD}offload clean --list-all${N}         Show all recipes including inapplicable
+
+Available recipes:
+  arduino_trim      android_nuke        android_trim
+  library_caches    pnpm_migrate        xcode_derived
+  go_module_cache   brew_cleanup        podman_prune
+  trash_empty       node_modules_orphans
+  app_support_report (read-only)        big_files_report (read-only)
+EOF
+        ;;
+      add)
+        cat <<EOF
+${BOLD}offload add <name>${N}
+Migrate ~/<name> to external disk (\$EXT_HOME/<name>), replace with symlink.
+Handles: missing, local-dir (rsync+symlink), wrong-symlink (re-link).
+Adds entry to ~/.offload-config on success.
+EOF
+        ;;
+      remove)
+        cat <<EOF
+${BOLD}offload remove <name>${N}
+Reverse migration: rsync external copy back to ~/<name>, remove symlink,
+remove config entry. Optionally delete the external copy after restore.
+EOF
+        ;;
+      doctor)
+        cat <<EOF
+${BOLD}offload doctor${N}
+Full health check: config, disk mounts, disk space (<10% warns),
+symlink states, services, pnpm store, stale /tmp sentinels.
+EOF
+        ;;
+      log)
+        cat <<EOF
+${BOLD}offload log${N}             Show full audit log (~/.offload-log)
+${BOLD}offload log --tail N${N}    Last N entries
+EOF
+        ;;
+      *)
+        err "No detailed help for: $sub"
+        ;;
+    esac
+    return
+  fi
+
+  cat <<EOF
+${BOLD}offload${N} — unified offload manager
+
+${BOLD}Daily:${N}
+  ${C}start${N}              Verify disk, start services
+  ${C}stop${N}  [--force]    Stop services, eject disk
+  ${C}status${N}             Overview (default)
+  ${C}verify${N}             Check all symlinks & services
+
+${BOLD}Maintenance:${N}
+  ${C}scan${N}               Find new symlink candidates
+  ${C}add${N} <name>         Migrate ~/<name> to external & symlink
+  ${C}remove${N} <name>      Un-symlink, restore data to home
+  ${C}doctor${N}             Diagnose problems & suggest fixes
+
+${BOLD}Cleanup:${N}
+  ${C}clean${N}                      List applicable recipes
+  ${C}clean${N} <recipe>             Run one recipe
+  ${C}clean${N} <recipe> --dry-run   Preview only
+  ${C}clean${N} <recipe> --yes       Skip confirmations
+  ${C}clean${N} all [--yes]          Walk all applicable recipes
+  ${C}clean${N} --list-all           Show all recipes
+
+${BOLD}Audit:${N}
+  ${C}log${N}                Show audit log
+  ${C}log${N} --tail N       Last N entries
+
+${BOLD}Global flags:${N}  --yes  --dry-run
+
+${BOLD}Config:${N}  ~/.offload-config
+${BOLD}State:${N}   ~/.offload-state
+${BOLD}Log:${N}     ~/.offload-log
+
+Use ${C}offload help <command>${N} for details on any command.
+EOF
+}
+
+# ─── dispatch ──────────────────────────────────────────────────────────
+CMD="${1:-status}"
+shift 2>/dev/null
+case "$CMD" in
+  status)         cmd_status ;;
+  start)          cmd_start "$@" ;;
+  stop)           cmd_stop "$@" ;;
+  verify)         cmd_verify ;;
+  scan)           cmd_scan ;;
+  add)            cmd_add "$@" ;;
+  remove)         cmd_remove "$@" ;;
+  clean)          cmd_clean "$@" ;;
+  doctor)         cmd_doctor ;;
+  log)            cmd_log "$@" ;;
+  help|-h|--help) cmd_help "$@" ;;
+  *)
+    err "Unknown command: $CMD"
+    echo ""
+    cmd_help
+    exit 1
+    ;;
+esac

@@ -1,0 +1,11 @@
+# Personal one-off scripts — not part of offload
+fix-go-symlink.sh
+migrate-to-external.sh
+ollama-setup.sh
+ollama-start.sh
+podman-setup.sh
+
+# Personal config and runtime files
+.offload-config
+.offload-log
+.offload-state
