@@ -129,6 +129,9 @@ offload clean android_trim   # removes Android emulator/system-images (~7 GB)
 offload clean brew_cleanup   # runs brew cleanup
 offload clean library_caches # wipes ~/Library/Caches (~5-10 GB)
 
+# First time on a new machine
+offload setup    # migrate all symlinks, init services, start
+
 # Morning / evening workflow
 offload start    # verify disk, start services
 offload stop     # stop services, eject disk safely
@@ -190,6 +193,25 @@ SERVICE|podman|podman machine start|podman machine stop|podman machine list --fo
 SERVICE|ollama|ollama serve > /tmp/ollama.log 2>&1 &|pkill -x ollama|pgrep -x ollama
 ```
 
+### One-time init commands
+
+Used by `offload setup` to initialize services that require a one-time setup step (e.g. `podman machine init`) before they can be started. The check command is run first — if it exits 0 the init step is skipped.
+
+```
+INIT|<name>|<init-command>|<check-if-already-done>
+```
+
+Check field is optional. If omitted the init command always runs.
+
+Examples:
+
+```
+# Podman needs machine init once; check if machine already exists
+INIT|podman|podman machine init|podman machine ls --format '{{.Name}}' | grep -q podman-machine-default
+```
+
+Ollama has no machine init step — it is handled entirely by its `SERVICE` entry.
+
 ### Never-symlink list
 
 Prevents `offload scan` from suggesting these as candidates, and `offload add` from migrating them:
@@ -223,6 +245,9 @@ SYMLINK|.ollama|/Volumes/backup/home/.ollama|Ollama models
 # Services
 SERVICE|podman|podman machine start|podman machine stop|podman machine list --format '{{.Running}}' | grep -q true
 
+# One-time init (run by: offload setup)
+INIT|podman|podman machine init|podman machine ls --format '{{.Name}}' | grep -q podman-machine-default
+
 # Never symlink
 NEVER|.ssh|Permissions sensitive
 NEVER|.config|Shell startup dependency
@@ -237,6 +262,7 @@ NEVER|Downloads|User intent
 
 ```
 offload                              # alias for: offload status
+offload setup                        # first-time: migrate symlinks, init services, start
 offload status                       # overview: disk, mount, symlinks, services
 offload start                        # work-start: verify disk, start services
 offload stop [--force]               # work-stop: stop services, eject disk
@@ -292,6 +318,29 @@ Filesystem   Size   Used  Avail  ...
 
 ---
 
+### `offload setup`
+
+Run once when setting up a new machine or after cloning the repo for the first time.
+
+```
+offload setup
+```
+
+What it does, in order:
+
+1. **Checks disk is mounted** — aborts if external disk not found
+2. **Migrates all `SYMLINK` entries** — for each entry, detects current state and acts:
+   - Local directory → rsync to external, replace with symlink
+   - Already correctly symlinked → skipped
+   - Missing → creates target dir + symlink
+   - Wrong symlink → prompts to re-link
+3. **Runs `INIT` commands** — skips if check command exits 0 (already done)
+4. **Starts all services** — same as `offload start`
+
+Safe to re-run — every step is idempotent.
+
+---
+
 ### `offload start` / `offload stop`
 
 **start:** Checks disk is mounted, verifies no broken symlinks, starts configured services. Safe to run every morning.
@@ -300,9 +349,12 @@ Filesystem   Size   Used  Avail  ...
 ```
 ✗ Processes still using /Volumes/backup:
     Finder (12345)
+    nvim (88024)
 ```
 
-Use `offload stop --force` to eject anyway (may cause data corruption — only if you know what you're doing).
+Close those processes and re-run, or use `offload stop --force` to force-unmount immediately (`diskutil unmount force`). Force-unmount is safe — any open files are flushed before the unmount completes.
+
+> **Note:** If your dev environment is symlinked to the external disk (shells, editors, LSP servers etc.), the busy list will be long. That is expected — use `--force` to unmount anyway, then close your terminal sessions.
 
 ---
 

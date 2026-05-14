@@ -130,7 +130,10 @@ cmd_stop() {
   step "Checking for processes holding the disk"
   if mount_check; then
     local busy
-    busy=$(lsof "$EXT_MOUNT" 2>/dev/null | tail -n +2 | awk '{print $1 " (" $2 ")"}' | sort -u)
+    # Filter out transient pipe processes spawned by this script (lsof, awk, sort, tail, sed)
+    busy=$(lsof "$EXT_MOUNT" 2>/dev/null | tail -n +2 \
+      | awk '$1 !~ /^(lsof|awk|sort|tail|sed)$/ {print $1 " (" $2 ")"}' \
+      | sort -u)
     if [[ -n "$busy" ]]; then
       err "Processes still using $EXT_MOUNT:"
       echo "$busy" | sed 's/^/    /'
@@ -144,11 +147,14 @@ cmd_stop() {
     fi
 
     step "Ejecting $EXT_MOUNT"
-    if diskutil eject "$EXT_MOUNT" 2>/dev/null; then
-      ok "Disk ejected — safe to unplug"
+    if [[ "$1" == "--force" ]]; then
+      diskutil unmount force "$EXT_MOUNT" 2>/dev/null \
+        && ok "Disk force-unmounted — safe to unplug" \
+        || { err "Force unmount failed. Try: sudo umount -f $EXT_MOUNT"; return 1; }
     else
-      err "Eject failed. Try: diskutil unmount force $EXT_MOUNT"
-      return 1
+      diskutil eject "$EXT_MOUNT" 2>/dev/null \
+        && ok "Disk ejected — safe to unplug" \
+        || { err "Eject failed. Try: offload stop --force"; return 1; }
     fi
   else
     info "Disk already unmounted"
@@ -583,12 +589,92 @@ cmd_log() {
   fi
 }
 
+# ─── setup — first-time initialization ───────────────────────────────
+cmd_setup() {
+  header "First-time setup"
+
+  step "Checking external disk"
+  if ! mount_check; then
+    err "External disk not mounted — plug in disk first"
+    info "Then run: offload setup"
+    return 1
+  fi
+  ok "Disk mounted — $(df -h "$EXT_MOUNT" | awk 'NR==2 {print $4}') free"
+
+  header "Migrating symlinks"
+  for line in "${SYMLINKS[@]}"; do
+    parse_symlink "$line"
+    migrate_path "$SL_SRC" "$SL_DST"
+  done
+
+  if (( ${#INITS[@]} > 0 )); then
+    header "Initializing services"
+    local ini_name ini_cmd ini_check
+    for line in "${INITS[@]}"; do
+      parse_init "$line"
+      ini_name="$INI_NAME"; ini_cmd="$INI_CMD"; ini_check="$INI_CHECK"
+      if [[ -n "$ini_check" ]] && eval "$ini_check" >/dev/null 2>&1; then
+        ok "$ini_name already initialized"
+        continue
+      fi
+      step "Initializing $ini_name"
+      if $DRY_RUN; then
+        dim "  [dry-run] $ini_cmd"
+      else
+        eval "$ini_cmd"
+        ok "$ini_name initialized"
+      fi
+    done
+  fi
+
+  header "Starting services"
+  local sv_name sv_start sv_check
+  for line in "${SERVICES[@]}"; do
+    parse_service "$line"
+    sv_name="$SV_NAME"; sv_start="$SV_START"; sv_check="$SV_CHECK"
+    if service_running "$sv_check"; then
+      ok "$sv_name already running"
+    else
+      step "Starting $sv_name"
+      if $DRY_RUN; then
+        dim "  [dry-run] $sv_start"
+      else
+        eval "$sv_start" 2>/dev/null
+        sleep 2
+        if service_running "$sv_check"; then
+          ok "$sv_name ready"
+        else
+          warn "$sv_name didn't start cleanly"
+        fi
+      fi
+    fi
+  done
+
+  date '+%Y-%m-%d %H:%M:%S' >"$STATE_FILE"
+  log_action "setup"
+  echo ""
+  echo "${BOLD}${G}Setup complete.${N}  Use ${C}offload start${N} for daily use."
+}
+
 # ─── help ──────────────────────────────────────────────────────────────
 cmd_help() {
   local sub="${1:-}"
 
   if [[ -n "$sub" ]]; then
     case "$sub" in
+      setup)
+        cat <<EOF
+${BOLD}offload setup${N}
+First-time initialization: migrates all configured SYMLINK entries to external
+disk, runs any INIT commands (e.g. podman machine init), then starts all
+services. Safe to re-run — already-done steps are skipped automatically.
+
+Config directives used:
+  SYMLINK|src|dst|desc       — migrated via rsync if local dir exists
+  INIT|name|cmd|check        — check exits 0 = skip, non-zero = run cmd
+  SERVICE|name|start|stop|check — started after init
+EOF
+        ;;
       start)
         cat <<EOF
 ${BOLD}offload start${N}
@@ -658,6 +744,9 @@ EOF
   cat <<EOF
 ${BOLD}offload${N} — unified offload manager
 
+${BOLD}First time:${N}
+  ${C}setup${N}              Migrate symlinks, init services, start
+
 ${BOLD}Daily:${N}
   ${C}start${N}              Verify disk, start services
   ${C}stop${N}  [--force]    Stop services, eject disk
@@ -697,6 +786,7 @@ CMD="${1:-status}"
 shift 2>/dev/null
 case "$CMD" in
   status)         cmd_status ;;
+  setup)          cmd_setup ;;
   start)          cmd_start "$@" ;;
   stop)           cmd_stop "$@" ;;
   verify)         cmd_verify ;;

@@ -22,6 +22,7 @@ load_config() {
 
   SYMLINKS=()
   SERVICES=()
+  INITS=()
   NEVER=()
 
   while IFS= read -r line; do
@@ -31,6 +32,7 @@ load_config() {
     case "$line" in
       SYMLINK\|*) SYMLINKS+=("$line") ;;
       SERVICE\|*) SERVICES+=("$line") ;;
+      INIT\|*)    INITS+=("$line") ;;
       NEVER\|*) NEVER+=("$line") ;;
       EXT_MOUNT=*) EXT_MOUNT="${line#EXT_MOUNT=}" ;;
       EXT_HOME=*) EXT_HOME="${line#EXT_HOME=}" ;;
@@ -74,6 +76,15 @@ parse_symlink() {
   SL_SRC="${rest%%|*}"; rest="${rest#*|}"
   SL_DST="${rest%%|*}"; rest="${rest#*|}"
   SL_DESC="$rest"
+}
+
+# Parse an INIT|... line into globals: INI_NAME, INI_CMD, INI_CHECK (optional)
+parse_init() {
+  local line="$1"
+  local rest="${line#INIT|}"
+  INI_NAME="${rest%%|*}"; rest="${rest#*|}"
+  INI_CMD="${rest%%|*}"; rest="${rest#*|}"
+  INI_CHECK="$rest"
 }
 
 # Parse a SERVICE|... line into globals: SV_NAME, SV_START, SV_STOP, SV_CHECK
